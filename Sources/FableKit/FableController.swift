@@ -55,13 +55,9 @@ public final class FableController: @unchecked Sendable, SignalReceiver {
     
     let clock = ContinuousClock()
     
-    // var boundaryTimeObservers: [Any] = []
     internal var cancelBag: [any Cancellable] = []
     
     var dimming: Double = 1
-    
-    // internal var avPlayer = AVQueuePlayer()
-    // internal var avPlayerDidPlayToEndTimeNotificationCancellation: AnyCancellable? = nil
     
     var isPreloadComplete = false
     var isReady: Bool = false
@@ -77,9 +73,14 @@ public final class FableController: @unchecked Sendable, SignalReceiver {
     @ObservationIgnored var currentHeadRotation: simd_float3x3 = .init(0)
 
     var entityGarbageBag: [(id: Entity.ID, hasBeenCollected: Bool)] = []
+    var taskBag: [Task<Void, any Error>] = []
     var garbageColleector: Task<Void, any Error>?
 
     private var realityViewContent: RealityViewContent? = nil
+
+    var removeAllElementOnNextUpdate: Bool = false
+    
+    @ObservationIgnored @Environment(\.scenePhase) var scenePhase
     
     @MainActor
     public init?(fable: Fable) {
@@ -195,7 +196,7 @@ public final class FableController: @unchecked Sendable, SignalReceiver {
                 }
             }
 
-            Task {
+            Task { @MainActor in
                 self._floatingViewAttachmentsToAdd.removeAll()
             }
             
@@ -251,21 +252,23 @@ public final class FableController: @unchecked Sendable, SignalReceiver {
                 
                 if case .time(let duration, _) = entityElement.lifetime, !entry.ignoreLifetime {
                     if let fadeInOutDuration = entityElement.fadeInOutDuration {
-                        Task {
+                        self.taskBag.append (Task {
                             guard let fadeOutAnimationResource = entityElement.fadeInOutAnimation.out else {
                                 return
                             }
                             try await Task.sleep(for: duration - fadeInOutDuration.out)
+                            try Task.checkCancellation()
                             entityElement.entity?.playAnimation(fadeOutAnimationResource, transitionDuration: 0, startsPaused: false)
-                        }
+                        })
                     }
-                    Task {
+                    self.taskBag.append(Task {
                         try await Task.sleep(for: duration)
+                        try Task.checkCancellation()
                         self.entitiesToRemove.append(entityElement)
                         if let id = entityElement.entity?.id {
                             self.entityGarbageBag.append((id, false))
                         }
-                    }
+                    })
                 }
                 
                 content.add(entity)
@@ -273,14 +276,14 @@ public final class FableController: @unchecked Sendable, SignalReceiver {
                     entityElement.entity?.playAnimation(fadeInAnimation, transitionDuration: 0, startsPaused: false)
                 }
                 
-                Task {
+                Task { @MainActor in
                     self.activeElements.append(entityElement)
                 }
                 
                 if let onRender = entityElement.onRender { onRender(self) }
             }
             
-            Task {
+            Task { @MainActor in
                 self._entitiesToAdd.removeAll()
             }
             
@@ -291,7 +294,7 @@ public final class FableController: @unchecked Sendable, SignalReceiver {
                     content.remove(entity)
                 }
                 
-                Task {
+                Task { @MainActor in
                     self.activeElements.removeAll { $0.id == entityElement.id }
                 }
             }
@@ -313,15 +316,30 @@ public final class FableController: @unchecked Sendable, SignalReceiver {
         }
         .preferredSurroundingsEffect(SurroundingsEffect.dim(intensity: dimming))
         .task {
-            try? await self.session.run([self.worldInfo])
-            do { self.fable = try await self.fable.preloaded(context: self) }
-            catch {
-                fatalError("Fable Content cannot be Loaded. \(error)")
+            if !self.isPreloadComplete {
+                try? await self.session.run([self.worldInfo])
+                do {
+                    self.fable = try await self.fable.preloaded(context: self)
+                    self.isPreloadComplete = true
+                }
+                catch {
+                    fatalError("Fable Content cannot be Loaded. \(error)")
+                }
+                
+                try? await self.clock.sleep(for: .seconds(1))
+                self.next()
             }
-            
-            try? await self.clock.sleep(for: .seconds(1))
-            self.next()
+//                self.reset()
+//            }
         }
+    }
+
+    @MainActor
+    public func reset() {
+        self.removeAllElement()
+        self.currentPageIndex = 0
+        self.currentElementIndex = -1
+        self.next()
     }
     
     @MainActor
@@ -433,6 +451,26 @@ public final class FableController: @unchecked Sendable, SignalReceiver {
     }
     
     @MainActor
+    public func stopAllMedia() {
+        for element in activeElements {
+            if let media = element as? Media {
+                media.pause()
+            }
+        }
+    }
+
+    @MainActor
+    func removeAllElement() {
+        removeAllElementOnNextUpdate = true
+        taskBag.forEach { $0.cancel() }
+//        activeElements.forEach {
+//            removeElement($0)
+//        }
+        timedQueue.forEach { $0.value.forEach{ $0.cancel() } }
+        timedQueue.removeAll()
+    }
+    
+    @MainActor
     func removeElement(id: UUID) {
         guard let element = activeElements.first(where: { $0.id == id }) else {
             print("cannot find \(id.uuidString)")
@@ -480,10 +518,6 @@ public final class FableController: @unchecked Sendable, SignalReceiver {
         }
         timedQueue.removeValue(forKey: id)
     }
-    
-    // func clearBoundaryTimeObserver() {
-    //     boundaryTimeObservers.forEach { avPlayer.removeTimeObserver($0) }
-    // }
     
     public func onReceive(_ message: Message) {
         switch message {
