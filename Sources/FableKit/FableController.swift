@@ -353,6 +353,13 @@ public final class FableController: @unchecked Sendable, SignalReceiver {
                 if let media = element as? Media {
                     media.avPlayer.pause()
                     media.avPlayer.removeAllItems()
+//                    removeElement(media.entityElement)
+                }
+            }
+            
+            if let concurrent = element as? ConcurrentElement {
+                for element in concurrent.elements {
+                    removeElement(element)
                 }
             }
         }
